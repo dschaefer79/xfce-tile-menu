@@ -59,6 +59,17 @@ WIDTHxHEIGHT` switches the resolution. `xfce-tile-menu-setup` and
 `xfce-resolution-menu-setup` put the menus on the panel (`--remove` takes them
 off, `--status` says whether they are there).
 
+## Installing
+
+On **Fedora 45**:
+
+```
+sudo dnf install https://github.com/dschaefer79/xfce-tile-menu/releases/download/v2.17/xfce-tile-menu-2.17-1.fc45.noarch.rpm
+```
+
+Both menus are put on the panel at the next login, or right away after
+`xfce-tile-menu-setup` and `xfce-resolution-menu-setup`.
+
 ## Building the RPM
 
 ```
