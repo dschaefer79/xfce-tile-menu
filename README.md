@@ -68,6 +68,8 @@ From the [latest GitHub release](https://github.com/dschaefer79/xfce-tile-menu/r
 | Fedora 45 | Xfce 4.20 | `xfce-tile-menu-2.17-1.fc45.noarch.rpm` |
 | Fedora 44 | Xfce 4.20 | `xfce-tile-menu-2.17-1.fc44.noarch.rpm` |
 | Ubuntu 26.10 | Xfce 4.20 | `xfce-tile-menu_2.17-1_all.deb` |
+| Ubuntu 26.04 | Xfce 4.20 | `xfce-tile-menu_2.17-1_all.deb` |
+| Linux Mint 22.3 (Xfce) | Xfce 4.18 | `xfce-tile-menu_2.17-1_all.deb` |
 | Debian 13 (trixie) | Xfce 4.20 | `xfce-tile-menu_2.17-1_all.deb` |
 
 On Fedora:
