@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tile automatically
+Comment=Tile into the columns and rows set for the screen size
+Icon=view-app-grid-symbolic
+Exec=xfce-tile auto
+Terminal=false
+StartupNotify=false

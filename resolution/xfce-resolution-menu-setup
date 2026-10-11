@@ -1,0 +1,199 @@
+#!/usr/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+# Add (or remove) the resolution menu button on the top XFCE panel.
+#   xfce-resolution-menu-setup          add the button
+#   xfce-resolution-menu-setup --auto   add it once per user (used at login)
+#   xfce-resolution-menu-setup --remove remove the button
+#   xfce-resolution-menu-setup --status print "on" if the button is on a panel, else "off"
+set -eu
+
+# Bump when the panel setup changes, so --auto upgrades existing users.
+setup_version=2
+confdir="${XDG_CONFIG_HOME:-$HOME/.config}"
+menudir="$confdir/xfce-resolution-menu"
+menufile="$menudir/resolutions.menu"
+marker="$menudir/added"
+
+q() { xfconf-query -c xfce4-panel "$@"; }
+# Print the integer values of an xfconf array property.
+array() { q -p "$1" 2>/dev/null | grep -E '^[0-9]+$' || true; }
+
+dropped=""
+
+# Restart the panel, then purge removed plugins' settings. Purging only after
+# the restart matters: the exiting panel saves its plugins' settings again.
+restart_panel() {
+    if pgrep -u "$(id -u)" -x xfce4-panel >/dev/null; then
+        xfce4-panel -r
+        [ -z "$dropped" ] || sleep 2
+    fi
+    for id in $dropped; do
+        q -p "/plugins/plugin-$id" -r -R 2>/dev/null || true
+        rm -rf "$confdir/xfce4/panel/launcher-$id"
+    done
+}
+
+# Print "panel plugin" for each of our buttons: kind is "menu" or "legacy".
+find_plugins() {
+    for p in $(array /panels); do
+        for i in $(array "/panels/panel-$p/plugin-ids"); do
+            if q -p "/plugins/plugin-$i/custom-menu-file" 2>/dev/null |
+                    grep -q '/xfce-resolution-menu/'; then
+                echo "$p $i menu"
+            elif q -p "/plugins/plugin-$i/items" 2>/dev/null |
+                    grep -q '^xfce-resolution-'; then
+                echo "$p $i legacy"
+            fi
+        done
+    done
+}
+
+# Replace plugin id $2 on panel $1 with $3 (empty $3 just removes it).
+replace_id() {
+    panel=$1 old=$2 new=$3
+    set --
+    for i in $(array "/panels/panel-$panel/plugin-ids"); do
+        if [ "$i" = "$old" ]; then
+            [ -z "$new" ] || set -- "$@" -t int -s "$new"
+        else
+            set -- "$@" -t int -s "$i"
+        fi
+    done
+    q -p "/panels/panel-$panel/plugin-ids" --force-array "$@"
+}
+
+drop_plugin() { dropped="$dropped $1"; }
+
+new_plugin_id() {
+    id=$(q -l -p /plugins | sed -n 's|^/plugins/plugin-\([0-9]*\).*|\1|p' | sort -n | tail -1)
+    echo $(( ${id:-0} + 1 ))
+}
+
+create_menu_plugin() {
+    q -n -p "/plugins/plugin-$1" -t string -s applicationsmenu
+    q -n -p "/plugins/plugin-$1/custom-menu" -t bool -s true
+    q -n -p "/plugins/plugin-$1/custom-menu-file" -t string -s "$menufile"
+    q -n -p "/plugins/plugin-$1/button-icon" -t string -s video-display
+    q -n -p "/plugins/plugin-$1/button-title" -t string -s Resolution
+    q -n -p "/plugins/plugin-$1/show-button-title" -t bool -s false
+    q -n -p "/plugins/plugin-$1/show-generic-names" -t bool -s false
+    q -n -p "/plugins/plugin-$1/show-tooltips" -t bool -s false
+}
+
+mark_done() {
+    mkdir -p "$menudir"
+    echo "$setup_version" >"$marker"
+}
+
+add() {
+    xfce-resolution-menu-settings --regenerate
+
+    has_menu=no
+    legacy=""
+    for entry in $(find_plugins | tr ' ' ':'); do
+        case $entry in
+            *:menu) has_menu=yes ;;
+            *:legacy) legacy="$legacy $entry" ;;
+        esac
+    done
+
+    # Swap old arrow launchers for the menu in place (or just drop them).
+    for entry in $legacy; do
+        p=${entry%%:*} rest=${entry#*:}
+        old=${rest%%:*}
+        if [ "$has_menu" = no ]; then
+            id=$(new_plugin_id)
+            create_menu_plugin "$id"
+            replace_id "$p" "$old" "$id"
+            has_menu=yes
+            echo "Replaced old resolution launcher on panel $p."
+        else
+            replace_id "$p" "$old" ""
+        fi
+        drop_plugin "$old"
+    done
+
+    if [ "$has_menu" = yes ]; then
+        mark_done
+        restart_panel
+        return
+    fi
+
+    panels=$(array /panels)
+    [ -n "$panels" ] || { echo "No XFCE panels configured." >&2; exit 1; }
+
+    # Prefer a panel snapped to the top edge (NE, NW, top center, top).
+    panel=""
+    for p in $panels; do
+        case $(q -p "/panels/panel-$p/position" 2>/dev/null) in
+            p=2\;*|p=6\;*|p=9\;*|p=11\;*) panel=$p; break ;;
+        esac
+    done
+    if [ -z "$panel" ]; then
+        set -- $panels
+        panel=$1
+    fi
+
+    id=$(new_plugin_id)
+    create_menu_plugin "$id"
+
+    # Insert left of the system tray, else left of the clock, else at the end.
+    ids=$(array "/panels/panel-$panel/plugin-ids")
+    before=""
+    for want in systray clock; do
+        for i in $ids; do
+            if [ "$(q -p "/plugins/plugin-$i" 2>/dev/null)" = "$want" ]; then
+                before=$i
+                break 2
+            fi
+        done
+    done
+    set --
+    for i in $ids; do
+        [ "$i" = "$before" ] && set -- "$@" -t int -s "$id"
+        set -- "$@" -t int -s "$i"
+    done
+    [ -n "$before" ] || set -- "$@" -t int -s "$id"
+    q -p "/panels/panel-$panel/plugin-ids" --force-array "$@"
+
+    mark_done
+    restart_panel
+    echo "Added resolution menu to panel $panel."
+}
+
+remove() {
+    found=$(find_plugins)
+    if [ -z "$found" ]; then
+        echo "Resolution menu is not on any panel."
+        return
+    fi
+    for entry in $(echo "$found" | tr ' ' ':'); do
+        p=${entry%%:*} rest=${entry#*:}
+        id=${rest%%:*}
+        replace_id "$p" "$id" ""
+        drop_plugin "$id"
+        echo "Removed resolution menu from panel $p."
+    done
+    restart_panel
+}
+
+case ${1:-} in
+    "") add ;;
+    --auto)
+        # Keep the user's menu in step with this version's entries.
+        xfce-resolution-menu-settings --regenerate 2>/dev/null || true
+        # "removed" means the user took the button off; respect that.
+        case $(cat "$marker" 2>/dev/null) in
+            "$setup_version"|removed) ;;
+            *) add ;;
+        esac ;;
+    --status)
+        if find_plugins | grep -q ' menu$'; then echo on; else echo off; fi ;;
+    --remove)
+        remove
+        mkdir -p "$menudir"
+        echo removed >"$marker" ;;
+    *) echo "usage: xfce-resolution-menu-setup [--auto|--remove|--status]" >&2; exit 2 ;;
+esac

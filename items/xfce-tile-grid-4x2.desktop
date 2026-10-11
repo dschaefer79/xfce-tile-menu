@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tile in 4 × 2 grid
+Comment=Tile the front windows into 4 columns and 2 rows
+Icon=xfce-tile-grid-4x2-symbolic
+Exec=xfce-tile grid-4x2
+Terminal=false
+StartupNotify=false

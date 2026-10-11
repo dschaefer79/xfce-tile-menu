@@ -1,0 +1,163 @@
+#!/usr/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+# Add (or remove) the window tiling menu button on the top XFCE panel.
+#   xfce-tile-menu-setup          add the button
+#   xfce-tile-menu-setup --auto   add it once per user (used at login)
+#   xfce-tile-menu-setup --remove remove the button
+#   xfce-tile-menu-setup --status print "on" if the button is on a panel, else "off"
+set -eu
+
+# Bump when the panel setup changes, so --auto upgrades existing users.
+# 2: each user's own menu, which xfce-tile keeps in step with the settings.
+setup_version=2
+confdir="${XDG_CONFIG_HOME:-$HOME/.config}"
+menufile="$confdir/xfce-tile-menu/tile.menu"
+marker="$confdir/xfce-tile-menu/added"
+
+q() { xfconf-query -c xfce4-panel "$@"; }
+# Print the integer values of an xfconf array property.
+array() { q -p "$1" 2>/dev/null | grep -E '^[0-9]+$' || true; }
+
+dropped=""
+
+# Restart the panel, then purge removed plugins' settings. Purging only after
+# the restart matters: the exiting panel saves its plugins' settings again.
+restart_panel() {
+    if pgrep -u "$(id -u)" -x xfce4-panel >/dev/null; then
+        xfce4-panel -r
+        [ -z "$dropped" ] || sleep 2
+    fi
+    for id in $dropped; do
+        q -p "/plugins/plugin-$id" -r -R 2>/dev/null || true
+    done
+}
+
+# Print "panel plugin" for each panel button showing the given menu file.
+find_menu() {
+    for p in $(array /panels); do
+        for i in $(array "/panels/panel-$p/plugin-ids"); do
+            if q -p "/plugins/plugin-$i/custom-menu-file" 2>/dev/null | grep -q "$1"; then
+                echo "$p $i"
+            fi
+        done
+    done
+}
+
+mark() {
+    mkdir -p "${marker%/*}"
+    echo "$1" >"$marker"
+}
+
+add() {
+    xfce-tile menu
+    found=$(find_menu /xfce-tile-menu/)
+    if [ -n "$found" ]; then
+        # Point buttons from before 2.0 at this user's own menu.
+        changed=no
+        for entry in $(echo "$found" | tr ' ' ':'); do
+            id=${entry#*:}
+            if [ "$(q -p "/plugins/plugin-$id/custom-menu-file")" != "$menufile" ]; then
+                q -p "/plugins/plugin-$id/custom-menu-file" -s "$menufile"
+                changed=yes
+            fi
+        done
+        mark "$setup_version"
+        [ "$changed" = no ] || restart_panel
+        echo "Tiling menu is already on the panel."
+        return
+    fi
+
+    panels=$(array /panels)
+    [ -n "$panels" ] || { echo "No XFCE panels configured." >&2; exit 1; }
+
+    # Next to the resolution menu if it is there, else on a top-edge panel.
+    panel="" before=""
+    res=$(find_menu /xfce-resolution-menu/ | head -1)
+    if [ -n "$res" ]; then
+        set -- $res
+        panel=$1 before=$2
+    else
+        for p in $panels; do
+            case $(q -p "/panels/panel-$p/position" 2>/dev/null) in
+                p=2\;*|p=6\;*|p=9\;*|p=11\;*) panel=$p; break ;;
+            esac
+        done
+        if [ -z "$panel" ]; then
+            set -- $panels
+            panel=$1
+        fi
+    fi
+
+    id=$(q -l -p /plugins | sed -n 's|^/plugins/plugin-\([0-9]*\).*|\1|p' | sort -n | tail -1)
+    id=$(( ${id:-0} + 1 ))
+    q -n -p "/plugins/plugin-$id" -t string -s applicationsmenu
+    q -n -p "/plugins/plugin-$id/custom-menu" -t bool -s true
+    q -n -p "/plugins/plugin-$id/custom-menu-file" -t string -s "$menufile"
+    q -n -p "/plugins/plugin-$id/button-icon" -t string -s org.xfce.xfwm4
+    q -n -p "/plugins/plugin-$id/button-title" -t string -s Tiling
+    q -n -p "/plugins/plugin-$id/show-button-title" -t bool -s false
+    q -n -p "/plugins/plugin-$id/show-generic-names" -t bool -s false
+
+    # Insert left of the resolution menu, else the tray, else the clock.
+    ids=$(array "/panels/panel-$panel/plugin-ids")
+    if [ -z "$before" ]; then
+        for want in systray clock; do
+            for i in $ids; do
+                if [ "$(q -p "/plugins/plugin-$i" 2>/dev/null)" = "$want" ]; then
+                    before=$i
+                    break 2
+                fi
+            done
+        done
+    fi
+    set --
+    for i in $ids; do
+        [ "$i" = "$before" ] && set -- "$@" -t int -s "$id"
+        set -- "$@" -t int -s "$i"
+    done
+    [ -n "$before" ] || set -- "$@" -t int -s "$id"
+    q -p "/panels/panel-$panel/plugin-ids" --force-array "$@"
+
+    mark "$setup_version"
+    restart_panel
+    echo "Added tiling menu to panel $panel."
+}
+
+remove() {
+    found=$(find_menu /xfce-tile-menu/)
+    if [ -z "$found" ]; then
+        echo "Tiling menu is not on any panel."
+        return
+    fi
+    for entry in $(echo "$found" | tr ' ' ':'); do
+        p=${entry%%:*} id=${entry#*:}
+        set --
+        for i in $(array "/panels/panel-$p/plugin-ids"); do
+            [ "$i" = "$id" ] || set -- "$@" -t int -s "$i"
+        done
+        q -p "/panels/panel-$p/plugin-ids" --force-array "$@"
+        dropped="$dropped $id"
+        echo "Removed tiling menu from panel $p."
+    done
+    restart_panel
+}
+
+case ${1:-} in
+    "") add ;;
+    --auto)
+        # Default keys for the tiling actions, once per user.
+        xfce-tile-settings --default-shortcuts 2>/dev/null || true
+        # Keep the user's menu in step with this version's entries and the
+        # keyboard shortcuts.
+        xfce-tile menu 2>/dev/null || true
+        # "removed" means the user took the button off; respect that.
+        case $(cat "$marker" 2>/dev/null) in
+            "$setup_version"|removed) ;;
+            *) add ;;
+        esac ;;
+    --remove) remove; mark removed ;;
+    --status) if [ -n "$(find_menu /xfce-tile-menu/)" ]; then echo on; else echo off; fi ;;
+    *) echo "usage: xfce-tile-menu-setup [--auto|--remove|--status]" >&2; exit 2 ;;
+esac

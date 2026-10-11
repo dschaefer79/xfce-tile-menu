@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tile in 2 columns
+Comment=Tile the front windows into 2 columns
+Icon=xfce-tile-columns-2-symbolic
+Exec=xfce-tile 2
+Terminal=false
+StartupNotify=false

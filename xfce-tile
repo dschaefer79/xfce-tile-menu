@@ -1,0 +1,1127 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+"""Tile the windows of the current workspace into columns, rows or a grid.
+
+  xfce-tile auto|4|3|2|rows-3|rows-2|grid-2x2|grid-3x2|grid-4x2|restore
+                      as in plasma-tile-menu: auto uses the counts for the
+                      screen size (see the settings), 4, 3 and 2 are columns,
+                      rows-3 and rows-2 rows, grid-CxR a grid; restore puts
+                      the windows back where they were before tiling
+  xfce-tile N | rows N | CxR
+                      N columns, N rows, or C columns and R rows
+  xfce-tile toggle snap|tile-new|disabled|vertical|horizontal
+                      flip a switch: automatic tiling (snapping dropped
+                      windows), tiling new windows, all tiling, or tiling
+                      into columns or rows (one of those two stays on)
+  xfce-tile get-toggles
+                      print the switches, as KEY=true|false
+  xfce-tile menu      rebuild this user's panel menu from the settings and
+                      the keyboard shortcuts
+  xfce-tile export FILE
+                      save the settings of the tiling and resolution menus
+                      and the keyboard shortcuts to FILE
+  xfce-tile import FILE
+                      load them from FILE
+  xfce-tile snap-daemon
+                      while automatic tiling, tiling new windows or
+                      resizing neighbouring windows together is on,
+                      snap each window dropped with the mouse into the
+                      column, row or grid cell under the pointer, and tile
+                      each new window with the others on its screen
+"""
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections import namedtuple
+from xml.sax.saxutils import escape
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Wnck  # noqa: E402
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "xfce-tile-menu",
+)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+MENU_FILE = os.path.join(CONFIG_DIR, "tile.menu")
+ITEMS_DIR = os.path.join(CONFIG_DIR, "items")
+STATE_FILE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "xfce-tile-menu", "restore.json",
+)
+# The settings of plasma-tile-menu, by the same names.
+DEFAULTS = {
+    "disabled": False,       # no tiling or snapping at all (Restore works)
+    "tileNew": False,        # tile each new window with the others
+    "showAuto": True,        # show "Tile automatically" in the menu
+    "vertical": True,        # auto tiles into columns
+    "horizontal": False,     # auto tiles into rows (both on: a grid)
+    "wideMinWidth": 5120,    # screens at least this wide count as wide
+    "wideColumns": 3,
+    "normalColumns": 2,
+    "tallMinHeight": 2160,   # screens at least this high count as tall
+    "tallRows": 3,
+    "normalRows": 2,
+    "gap": 0,                # pixels between and around windows
+    "gapUnit": "px",         # "px", or "mm" for gapMm millimetres
+    "gapMm": 2,
+    "snap": False,           # snap dropped windows into place
+    "snapShiftOnly": False,  # ... only when Shift is held
+    "snapShiftSwap": False,  # Shift swaps columns and rows
+    "resizeNeighbours": False,  # resizing an edge resizes the window beside it
+}
+LIMITS = {
+    "wideMinWidth": (640, 32768), "wideColumns": (1, 8), "normalColumns": (1, 8),
+    "tallMinHeight": (480, 32768), "tallRows": (1, 8), "normalRows": (1, 8),
+    "gap": (0, 100), "gapMm": (0, 50),
+}
+# Fixed layouts: (columns, rows), "auto" being the count for the screen.
+LAYOUTS = {
+    "auto": ("auto", "auto"),
+    "4": (4, "auto"),
+    "3": (3, "auto"),
+    "2": (2, "auto"),
+    "rows-3": ("auto", 3),
+    "rows-2": ("auto", 2),
+    "grid-2x2": (2, 2),
+    "grid-3x2": (3, 2),
+    "grid-4x2": (4, 2),
+}
+TOGGLES = {
+    "snap": "Automatic tiling",
+    "tileNew": "Tile new windows",
+    "disabled": "Disable tiling",
+    "vertical": "Tiling into columns",
+    "horizontal": "Tiling into rows",
+}
+# Command-line names of the switches, and those of xfce-tile 1.x.
+TOGGLE_NAMES = {
+    "snap": "snap", "tile-new": "tileNew", "tileNew": "tileNew",
+    "disabled": "disabled", "vertical": "vertical", "horizontal": "horizontal",
+}
+OLD_TOGGLES = {
+    "toggle": "disabled", "toggle-auto": "tileNew",
+    "toggle-vertical": "vertical", "toggle-horizontal": "horizontal",
+}
+Area = namedtuple("Area", "x y width height")
+GEOMETRY_MASK = (
+    Wnck.WindowMoveResizeMask.X | Wnck.WindowMoveResizeMask.Y
+    | Wnck.WindowMoveResizeMask.WIDTH | Wnck.WindowMoveResizeMask.HEIGHT
+)
+
+
+def migrate(old):
+    """Settings of xfce-tile-menu 1.x, in the names used now."""
+    def flag(key, default):
+        value = old.get(key, default)
+        return bool(value) if isinstance(value, int) else bool(default)
+
+    vertical = flag("tile_vertical", 1) and flag("vertical", 1)
+    horizontal = flag("tile_horizontal", 1) and flag("horizontal", 0)
+    new = {
+        "disabled": not flag("enabled", 1),
+        # 1.x snapped new windows into a free column, or tiled them all.
+        "tileNew": flag("auto_snap", 0),
+        # 1.x had no "Tile automatically" entry; keep the menu as it was.
+        "showAuto": False,
+        "vertical": vertical or not horizontal,
+        "horizontal": horizontal,
+        "snap": flag("snap", 0),
+        # A Shift drop snapped into rows instead of columns.
+        "snapShiftSwap": flag("snap", 0) and flag("tile_vertical", 1)
+                         and flag("tile_horizontal", 1),
+    }
+    for old_key, key in (("wide_min_width", "wideMinWidth"), ("wide_columns", "wideColumns"),
+                         ("normal_columns", "normalColumns"), ("normal_rows", "normalRows"),
+                         ("gap", "gap")):
+        if isinstance(old.get(old_key), int):
+            new[key] = old[old_key]
+    return new
+
+
+def load_settings():
+    settings = dict(DEFAULTS)
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if "enabled" in data and "version" not in data:
+        data = migrate(data)
+    return merge_settings(settings, data)
+
+
+def merge_settings(settings, data):
+    """Take over the known keys of data whose values are valid."""
+    for key, value in data.items():
+        if key not in DEFAULTS:
+            continue
+        default = DEFAULTS[key]
+        if isinstance(default, bool):
+            if isinstance(value, bool):
+                settings[key] = value
+        elif isinstance(default, int):
+            low, high = LIMITS[key]
+            if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+                settings[key] = value
+        elif key == "gapUnit" and value in ("px", "mm"):
+            settings[key] = value
+    # Tiling needs at least one direction.
+    if not settings["vertical"] and not settings["horizontal"]:
+        settings["vertical"] = True
+    return settings
+
+
+def write_file(path, text):
+    """Write text to path unless it already has it; True if it changed."""
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def save_settings(settings):
+    """Store the settings, update the panel menu and start or stop the
+    snap daemon as needed."""
+    write_file(CONFIG_FILE, json.dumps({"version": 2, **settings}, indent=2) + "\n")
+    write_menu(settings)
+    if daemon_wanted(settings):
+        start_snap_daemon()
+
+
+def daemon_wanted(settings):
+    return not settings["disabled"] and (
+        settings["snap"] or settings["tileNew"] or settings["resizeNeighbours"])
+
+
+def start_snap_daemon():
+    # Single-instance: a second daemon exits on its own.
+    subprocess.Popen(["xfce-tile", "snap-daemon"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(summary, body="", timeout=None):
+    args = ["notify-send", "-a", "Window Tiling", "-i", "view-grid-symbolic"]
+    if timeout:
+        args += ["-t", str(timeout)]
+    try:
+        subprocess.run(args + [summary] + ([body] if body else []), timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def snap_hint(settings):
+    """How dropping a window works with the current settings."""
+    if settings["disabled"] or not settings["snap"]:
+        return ""
+    rows = settings["horizontal"]
+    columns = settings["vertical"] or not rows
+    swapped = ("with columns and rows swapped" if columns and rows
+               else "into rows" if columns else "into columns")
+    if settings["snapShiftOnly"] and settings["snapShiftSwap"]:
+        return f"Hold Shift while dropping a window to snap it {swapped}."
+    if settings["snapShiftOnly"]:
+        return "Hold Shift while dropping a window to snap it."
+    if settings["snapShiftSwap"]:
+        return f"Drop a window to snap it; hold Shift to snap it {swapped}."
+    return "Drop a window to snap it into place."
+
+
+def accel_label(accel):
+    """A shortcut such as "<Super><Alt>4" as shown in the menu: "Super+Alt+4"."""
+    mods = []
+    while accel.startswith("<") and ">" in accel:
+        mod, _, accel = accel[1:].partition(">")
+        mods.append(mod.lower())
+    names = (("Super", ("super", "mod4")), ("Ctrl", ("primary", "control", "ctrl")),
+             ("Alt", ("alt", "mod1")), ("Shift", ("shift",)))
+    parts = [name for name, ids in names if any(i in mods for i in ids)]
+    return "+".join(parts + [accel.upper() if len(accel) == 1 else accel])
+
+
+def shortcut_labels():
+    """{command: shortcut label} of the XFCE application shortcuts in use."""
+    try:
+        out = subprocess.run(["xfconf-query", "-c", "xfce4-keyboard-shortcuts", "-l", "-v"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return {}
+    entries = [line.partition(" ") for line in out.splitlines()]
+    # XFCE uses the custom shortcuts once they exist, else its defaults.
+    custom = any(p == "/commands/custom/override" and v.strip() == "true"
+                 for p, _, v in entries)
+    prefix = "/commands/custom/" if custom else "/commands/default/"
+    labels = {}
+    for path, _, command in sorted(entries):
+        accel = path[len(prefix):]
+        if path.startswith(prefix) and accel != "override" and command.strip():
+            labels.setdefault(command.strip(), accel_label(accel))
+    return labels
+
+
+SHORTCUT_CHANNEL = "xfce4-keyboard-shortcuts"
+CUSTOM_SHORTCUTS = "/commands/custom/"
+
+
+def xfconf_shortcuts(*args):
+    return subprocess.run(["xfconf-query", "-c", SHORTCUT_CHANNEL, *args],
+                          capture_output=True, text=True)
+
+
+def custom_shortcuts():
+    """{accelerator: command} of the custom application shortcuts."""
+    shortcuts = {}
+    for line in xfconf_shortcuts("-l", "-v").stdout.splitlines():
+        if line.startswith(CUSTOM_SHORTCUTS):
+            path, _, command = line.partition(" ")
+            accel = path[len(CUSTOM_SHORTCUTS):]
+            if accel != "override":
+                shortcuts[accel] = command.strip()
+    return shortcuts
+
+
+def use_custom_shortcuts():
+    """Xfce only uses the custom shortcuts once the defaults have been
+    copied there, as its Keyboard settings do on the first change."""
+    if xfconf_shortcuts("-p", CUSTOM_SHORTCUTS + "override").stdout.strip() == "true":
+        return
+    for line in xfconf_shortcuts("-l", "-v").stdout.splitlines():
+        path, _, command = line.partition(" ")
+        if path.startswith("/commands/default/") and not path.endswith("/override"):
+            accel = path[len("/commands/default/"):]
+            xfconf_shortcuts("-n", "-p", CUSTOM_SHORTCUTS + accel, "-t", "string",
+                             "-s", command.strip())
+    xfconf_shortcuts("-n", "-p", CUSTOM_SHORTCUTS + "override", "-t", "bool", "-s", "true")
+
+
+def set_shortcut(command, accel, update_menu=True):
+    """Give command the shortcut accel (None: no shortcut)."""
+    use_custom_shortcuts()
+    for old, cmd in custom_shortcuts().items():
+        if cmd == command:
+            xfconf_shortcuts("-r", "-p", CUSTOM_SHORTCUTS + old)
+    if accel:
+        xfconf_shortcuts("-n", "-p", CUSTOM_SHORTCUTS + accel, "-t", "string", "-s", command)
+    # The menu shows the shortcuts.
+    if update_menu:
+        write_menu(load_settings())
+
+
+def window_effects():
+    """Whether xfwm4's compositor is on: window shadows, transparency and
+    fading. On unless turned off."""
+    out = subprocess.run(["xfconf-query", "-c", "xfwm4", "-p", "/general/use_compositing"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() != "false"
+
+
+def set_window_effects(on):
+    value = "true" if on else "false"
+    args = ["xfconf-query", "-c", "xfwm4", "-p", "/general/use_compositing"]
+    if subprocess.run(args + ["-s", value], capture_output=True).returncode != 0:
+        subprocess.run(args + ["-n", "-t", "bool", "-s", value], capture_output=True)
+
+
+# The commands that can have a shortcut.
+SHORTCUT_COMMANDS = ([f"xfce-tile {layout}" for layout in LAYOUTS] + ["xfce-tile restore"]
+                     + [f"xfce-tile toggle {name}" for name in ("snap", "tile-new", "disabled")])
+SETTINGS_FORMAT = "xfce-tile-menu settings"
+
+
+def load_resolution_menu():
+    """The resolution menu's settings program, for its list and options."""
+    path = shutil.which("xfce-resolution-menu-settings") or "/usr/bin/xfce-resolution-menu-settings"
+    loader = importlib.machinery.SourceFileLoader("xfce_resolution_menu", path)
+    spec = importlib.util.spec_from_loader("xfce_resolution_menu", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def export_settings(path):
+    """Save the settings of both menus and the shortcuts as one JSON file."""
+    shortcuts = {}
+    if xfconf_shortcuts("-p", CUSTOM_SHORTCUTS + "override").stdout.strip() == "true":
+        in_use = {cmd: accel for accel, cmd in custom_shortcuts().items()}
+    else:
+        in_use = {}
+        for line in xfconf_shortcuts("-l", "-v").stdout.splitlines():
+            key, _, command = line.partition(" ")
+            if key.startswith("/commands/default/"):
+                in_use.setdefault(command.strip(), key[len("/commands/default/"):])
+    for command in SHORTCUT_COMMANDS:
+        shortcuts[command] = in_use.get(command, "")
+    resolution = load_resolution_menu()
+    data = {
+        "format": SETTINGS_FORMAT,
+        "tiling": load_settings(),
+        "resolution": {"resolutions": resolution.load(), "options": resolution.load_options()},
+        "shortcuts": shortcuts,
+        "windowEffects": window_effects(),
+    }
+    write_file(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def same_kind(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool)
+    return type(a) is type(b)
+
+
+def import_settings(path):
+    """Load a file from export_settings; keys or values that do not fit are
+    left out."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+    if not isinstance(data, dict) or data.get("format") != SETTINGS_FORMAT:
+        sys.exit(f"{path} is not a Window Tiling settings file")
+    tiling = data.get("tiling")
+    if isinstance(tiling, dict):
+        save_settings(merge_settings(load_settings(), tiling))
+    resolution = data.get("resolution")
+    if isinstance(resolution, dict):
+        menu = load_resolution_menu()
+        modes = [m for m in resolution.get("resolutions", [])
+                 if isinstance(m, str) and menu.MODE_RE.match(m)]
+        if modes:
+            menu.save(list(dict.fromkeys(modes)))
+        options = resolution.get("options")
+        if isinstance(options, dict):
+            current = menu.load_options()
+            for key, value in options.items():
+                if key in current and same_kind(current[key], value):
+                    current[key] = value
+            menu.save_options(current)
+    if isinstance(data.get("windowEffects"), bool):
+        set_window_effects(data["windowEffects"])
+    shortcuts = data.get("shortcuts")
+    if isinstance(shortcuts, dict):
+        for command in SHORTCUT_COMMANDS:
+            accel = shortcuts.get(command)
+            if isinstance(accel, str):
+                set_shortcut(command, accel or None, update_menu=False)
+        write_menu(load_settings())
+
+
+def settings_file_dialog(parent, save):
+    """Choose a file and save or load the settings; True once loaded."""
+    chooser = Gtk.FileChooserDialog(
+        title="Save Window Tiling settings" if save else "Load Window Tiling settings",
+        transient_for=parent,
+        action=Gtk.FileChooserAction.SAVE if save else Gtk.FileChooserAction.OPEN)
+    chooser.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                        "Save" if save else "Open", Gtk.ResponseType.ACCEPT)
+    files = Gtk.FileFilter()
+    files.set_name("Settings files")
+    files.add_pattern("*.json")
+    chooser.add_filter(files)
+    if save:
+        chooser.set_current_name("tile-menu-settings.json")
+        chooser.set_do_overwrite_confirmation(True)
+    response = chooser.run()
+    path = chooser.get_filename()
+    chooser.destroy()
+    if response != Gtk.ResponseType.ACCEPT or not path:
+        return False
+    try:
+        (export_settings if save else import_settings)(path)
+        kind, text = Gtk.MessageType.INFO, ("Saved to " if save else "Loaded from ") + os.path.basename(path)
+    except (SystemExit, OSError, ValueError) as e:
+        kind, text, save = Gtk.MessageType.ERROR, str(e), True
+    message = Gtk.MessageDialog(transient_for=parent, modal=True, message_type=kind,
+                                buttons=Gtk.ButtonsType.OK, text="Window Tiling settings")
+    message.format_secondary_text(text)
+    message.run()
+    message.destroy()
+    return not save
+
+
+def desktop_entry(name, comment, icon, command, startup=False):
+    return (f"[Desktop Entry]\nVersion=1.0\nType=Application\nName={name}\n"
+            f"Comment={comment}\nIcon={icon}\nExec={command}\nTerminal=false\n"
+            f"StartupNotify={'true' if startup else 'false'}\n")
+
+
+def write_menu(settings):
+    """Build this user's panel menu (a garcon menu file and its entries)
+    from the settings, like the Plasma widget's menu: entries for the
+    directions that are on, and the switches with their state."""
+    rows = settings["horizontal"]
+    columns = settings["vertical"] or not rows
+    disabled = settings["disabled"]
+    off = " (tiling is disabled)" if disabled else ""
+    items = []
+    # Each entry shows its keyboard shortcut after the name.
+    keys = shortcut_labels()
+
+    def with_key(name, command):
+        return f"{name}   ({keys[command]})" if command in keys else name
+
+    def tile_item(name, layout, icon, comment):
+        command = f"xfce-tile {layout}"
+        items.append((f"xfce-tile-{layout}.desktop",
+                      desktop_entry(with_key(name, command), comment + off, icon, command)))
+
+    if settings["showAuto"]:
+        tile_item("Tile automatically", "auto", "view-app-grid-symbolic",
+                  "Tile into the columns and rows set for the screen size")
+    if columns:
+        tile_item("Tile in 4 columns", "4", "xfce-tile-columns-4-symbolic",
+                  "Tile the front windows into 4 columns")
+        tile_item("Tile in 3 columns", "3", "xfce-tile-columns-3-symbolic",
+                  "Tile the front windows into 3 columns")
+        tile_item("Tile in 2 columns", "2", "xfce-tile-columns-2-symbolic",
+                  "Tile the front windows into 2 columns")
+    if rows:
+        tile_item("Tile in 3 rows", "rows-3", "xfce-tile-rows-3-symbolic",
+                  "Tile the front windows into 3 rows")
+        tile_item("Tile in 2 rows", "rows-2", "xfce-tile-rows-2-symbolic",
+                  "Tile the front windows into 2 rows")
+    tile_item("Tile in 2 × 2 grid", "grid-2x2", "xfce-tile-grid-2x2-symbolic",
+              "Tile the front windows into 2 columns and 2 rows")
+    tile_item("Tile in 3 × 2 grid", "grid-3x2", "xfce-tile-grid-3x2-symbolic",
+              "Tile the front windows into 3 columns and 2 rows")
+    tile_item("Tile in 4 × 2 grid", "grid-4x2", "xfce-tile-grid-4x2-symbolic",
+              "Tile the front windows into 4 columns and 2 rows")
+    items.append(None)
+    items.append(("xfce-tile-restore.desktop", desktop_entry(
+        with_key("Restore windows", "xfce-tile restore"),
+        "Put the windows back where they were before tiling",
+        "view-restore-symbolic", "xfce-tile restore")))
+    items.append(None)
+    hint = snap_hint(settings)
+    for key, name, comment in (
+            ("snap", "Automatic tiling",
+             hint or "Snap windows into place when they are dropped"),
+            ("tileNew", "Tile new windows",
+             "Tile each window that opens together with the others"),
+            ("disabled", "Disable tiling",
+             "Turn all tiling and snapping off; Restore windows still works")):
+        icon = "checkbox-checked-symbolic" if settings[key] else "checkbox-symbolic"
+        option = "tile-new" if key == "tileNew" else key
+        items.append((f"xfce-tile-toggle-{option}.desktop",
+                      desktop_entry(name, comment, icon, f"xfce-tile toggle {option}")))
+    items.append(None)
+    items.append(("xfce-tile-shortcuts.desktop", desktop_entry(
+        "Keyboard shortcuts…", "Set keyboard shortcuts for tiling",
+        "preferences-desktop-keyboard-shortcuts", "xfce-tile-settings --shortcuts", True)))
+    items.append(("xfce-tile-settings.desktop", desktop_entry(
+        "Settings…", "Choose columns, rows, the window gap and snapping",
+        "org.xfce.settings.manager", "xfce-tile-settings", True)))
+    # Take the button off the panel; tiling and its shortcuts keep working.
+    items.append(("xfce-tile-quit.desktop", desktop_entry(
+        "Quit", "Remove the Tiling menu from the panel (Window Tiling Menu in the applications menu puts it back)",
+        "application-exit", "xfce-tile-menu-setup --remove")))
+
+    wanted = {item[0] for item in items if item}
+    os.makedirs(ITEMS_DIR, exist_ok=True)
+    for name in os.listdir(ITEMS_DIR):
+        if name.endswith(".desktop") and name not in wanted:
+            os.remove(os.path.join(ITEMS_DIR, name))
+    for item in items:
+        if item:
+            write_file(os.path.join(ITEMS_DIR, item[0]), item[1])
+    layout = "".join("    <Separator/>\n" if item is None else
+                     f"    <Filename>{escape(item[0])}</Filename>\n" for item in items)
+    write_file(MENU_FILE, f"""\
+<!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
+  "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
+<!-- Generated by xfce-tile from the settings; edits will be overwritten. -->
+<Menu>
+  <Name>Tiling</Name>
+  <AppDir>{escape(ITEMS_DIR)}</AppDir>
+  <Include><All/></Include>
+  <Layout>
+{layout}  </Layout>
+</Menu>
+""")
+
+
+def toggle(key):
+    """Flip a switch, say what it is now and return the new state."""
+    settings = load_settings()
+    other = {"vertical": "horizontal", "horizontal": "vertical"}.get(key)
+    if other and settings[key] and not settings[other]:
+        notify(f"{TOGGLES[key]} stays on",
+               f"{TOGGLES[other]} is off, and one of the two must stay on.")
+        return settings[key]
+    settings[key] = not settings[key]
+    save_settings(settings)
+    notify("Window Tiling", f"{TOGGLES[key]}: {'on' if settings[key] else 'off'}", 2000)
+    return settings[key]
+
+
+def write_json(path, data):
+    write_file(path, json.dumps(data, indent=2))
+
+
+def load_state():
+    """{"windows": {xid: entry}, "layouts": {monitor: [columns, rows]}}."""
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict) or "windows" not in state:
+        state = {"windows": {}, "layouts": {}}
+    state.setdefault("layouts", {})
+    return state
+
+
+def pump(seconds=0.0):
+    """Let Wnck/GDK process pending X events, optionally for a while."""
+    end = time.monotonic() + seconds
+    while True:
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        if time.monotonic() >= end:
+            break
+        time.sleep(0.02)
+
+
+def pointer():
+    display = Gdk.Display.get_default()
+    _, x, y = display.get_default_seat().get_pointer().get_position()
+    return x, y
+
+
+def monitor_at(x, y):
+    return Gdk.Display.get_default().get_monitor_at_point(int(x), int(y))
+
+
+def monitor_key(monitor):
+    g = monitor.get_geometry()
+    return f"{g.x},{g.y},{g.width}x{g.height}"
+
+
+def usable_area(screen, monitor):
+    """Monitor area not covered by panels.
+
+    Panels along a monitor edge are subtracted from the monitor directly,
+    and the result is clipped to the window manager's work area. That keeps
+    tiling right even when the work area goes stale after a resolution change.
+    """
+    geo = monitor.get_geometry()
+    left, top = geo.x, geo.y
+    right, bottom = geo.x + geo.width, geo.y + geo.height
+    for w in screen.get_windows():
+        if w.get_window_type() != Wnck.WindowType.DOCK:
+            continue
+        x, y, width, height = w.get_geometry()
+        if x >= right or x + width <= left or y >= bottom or y + height <= top:
+            continue  # on another monitor
+        if width >= height:  # horizontal panel
+            if y <= top:
+                top = max(top, y + height)
+            elif y + height >= bottom:
+                bottom = min(bottom, y)
+        else:  # vertical panel
+            if x <= left:
+                left = max(left, x + width)
+            elif x + width >= right:
+                right = min(right, x)
+    wa = monitor.get_workarea()
+    left, top = max(left, wa.x), max(top, wa.y)
+    right = min(right, wa.x + wa.width)
+    bottom = min(bottom, wa.y + wa.height)
+    return Area(left, top, right - left, bottom - top)
+
+
+def columns_for(settings, monitor):
+    wide = monitor.get_geometry().width >= settings["wideMinWidth"]
+    return settings["wideColumns"] if wide else settings["normalColumns"]
+
+
+def rows_for(settings, monitor):
+    tall = monitor.get_geometry().height >= settings["tallMinHeight"]
+    return settings["tallRows"] if tall else settings["normalRows"]
+
+
+def auto_columns(settings, monitor):
+    return columns_for(settings, monitor) if settings["vertical"] else 1
+
+
+def auto_rows(settings, monitor):
+    return rows_for(settings, monitor) if settings["horizontal"] else 1
+
+
+def gap_for(settings, monitor):
+    """The gap in pixels on this monitor; in millimetres it is worked out
+    from the monitor's physical width (or 96 dpi if unknown)."""
+    if settings["gapUnit"] != "mm":
+        return settings["gap"]
+    px_per_mm = 96 / 25.4
+    mm = monitor.get_width_mm()
+    if mm > 0:
+        px_per_mm = monitor.get_geometry().width / mm
+    return round(settings["gapMm"] * px_per_mm)
+
+
+def split(start, length, count, gap):
+    """(offset, size) of count spans across length, gaps between and around."""
+    size = (length - gap * (count + 1)) // count
+    spans = []
+    for i in range(count):
+        pos = start + gap + i * (size + gap)
+        # Give the last span any leftover pixels from rounding.
+        spans.append((pos, size if i < count - 1 else start + length - gap - pos))
+    return spans
+
+
+def cell_box(area, columns, rows, col, row, gap):
+    x, width = split(area.x, area.width, columns, gap)[col]
+    y, height = split(area.y, area.height, rows, gap)[row]
+    return x, y, width, height
+
+
+def cell_at(area, columns, rows, x, y):
+    """(col, row) of the cell under the point x, y."""
+    col = min(max(int((x - area.x) * columns // max(area.width, 1)), 0), columns - 1)
+    row = min(max(int((y - area.y) * rows // max(area.height, 1)), 0), rows - 1)
+    return col, row
+
+
+def center(w):
+    x, y, width, height = w.get_geometry()
+    return x + width / 2, y + height / 2
+
+
+def tileable(w):
+    return (w.get_window_type() == Wnck.WindowType.NORMAL
+            and not w.is_skip_tasklist()
+            and not w.is_minimized()
+            and w.get_transient() is None
+            and w.get_actions() & Wnck.WindowActions.RESIZE)
+
+
+def tileable_windows(screen, monitor=None):
+    """Tileable windows of the current workspace, topmost first; only those
+    on monitor if given."""
+    workspace = screen.get_active_workspace()
+    key = monitor_key(monitor) if monitor else None
+    wins = []
+    for w in reversed(screen.get_windows_stacked()):
+        if (tileable(w) and (workspace is None or w.is_on_workspace(workspace))
+                and (key is None or monitor_key(monitor_at(*center(w))) == key)):
+            wins.append(w)
+    return wins
+
+
+def frame_extra(w):
+    """Width/height the window manager adds around the client area."""
+    fx, fy, fw, fh = w.get_geometry()
+    cx, cy, cw, ch = w.get_client_window_geometry()
+    return max(fw - cw, 0), max(fh - ch, 0)
+
+
+def place_all(targets):
+    """Move each (window, x, y, width, height) so its frame fills that box.
+
+    Window managers differ in how they apply frame borders to move requests,
+    so after a first attempt measure where each frame landed and correct.
+    """
+    requests = []
+    for w, x, y, width, height in targets:
+        dw, dh = frame_extra(w)
+        req = [x, y, max(width - dw, 1), max(height - dh, 1)]
+        w.set_geometry(Wnck.WindowGravity.NORTHWEST, GEOMETRY_MASK, *req)
+        requests.append(req)
+    pump(0.3)
+    for (w, x, y, width, height), req in zip(targets, requests):
+        ax, ay, aw, ah = w.get_geometry()
+        if (ax, ay, aw, ah) != (x, y, width, height):
+            req = [req[0] + x - ax, req[1] + y - ay,
+                   max(req[2] + width - aw, 1), max(req[3] + height - ah, 1)]
+            w.set_geometry(Wnck.WindowGravity.NORTHWEST, GEOMETRY_MASK, *req)
+
+
+def unmaximize(windows):
+    changed = False
+    for w in windows:
+        if w.is_maximized() or w.is_maximized_horizontally() or w.is_maximized_vertically():
+            w.unmaximize()
+            changed = True
+        if w.is_fullscreen():
+            w.set_fullscreen(False)
+            changed = True
+    if changed:
+        pump(0.3)
+
+
+def near(a, b, slack=16):
+    return all(abs(p - q) <= slack for p, q in zip(a, b))
+
+
+def tile(screen, columns, rows, monitor=None):
+    """Tile into columns and rows (numbers or "auto") on monitor, by
+    default the one under the pointer."""
+    settings = load_settings()
+    if settings["disabled"]:
+        notify("Window tiling is off",
+               "Turn off “Disable tiling” in the Tiling menu to tile again.")
+        return
+    monitor = monitor or monitor_at(*pointer())
+    if columns == "auto":
+        columns = auto_columns(settings, monitor)
+    if rows == "auto":
+        rows = auto_rows(settings, monitor)
+    state = load_state()
+    state["layouts"][monitor_key(monitor)] = [columns, rows]
+
+    # Most recently used windows on this monitor fill the grid; the others go
+    # into the cell under their middle, behind them. Keep their
+    # left-to-right order across columns and top-to-bottom order within a
+    # column. Windows are spread evenly over the columns, so with fewer
+    # windows than cells the first columns get the extra rows.
+    stacked = tileable_windows(screen, monitor)
+    windows = stacked[:columns * rows]
+    background = stacked[columns * rows:]
+    windows.sort(key=lambda w: center(w)[0])
+    area = usable_area(screen, monitor)
+    gap = gap_for(settings, monitor)
+    targets = []
+    start = 0
+    for col in range(columns):
+        count = len(windows) // columns + (1 if col < len(windows) % columns else 0)
+        in_column = sorted(windows[start:start + count], key=lambda w: center(w)[1])
+        start += count
+        for row, w in enumerate(in_column):
+            targets.append((w, *cell_box(area, columns, rows, col, row, gap)))
+    # Moving a window does not raise it, so these stay in the background.
+    for w in background:
+        col, row = cell_at(area, columns, rows, *center(w))
+        targets.append((w, *cell_box(area, columns, rows, col, row, gap)))
+
+    # Remember where windows were, unless a window is still near where an
+    # earlier tiling put it: then keep its original position.
+    saved = state["windows"]
+    for w, *box in targets:
+        xid = str(w.get_xid())
+        entry = saved.get(xid)
+        if not entry or not near(entry.get("placed", []), w.get_geometry()):
+            saved[xid] = {"geometry": list(w.get_geometry()), "maximized": w.is_maximized()}
+        saved[xid]["placed"] = box
+    # Forget windows that are gone.
+    alive = {str(w.get_xid()) for w in screen.get_windows()}
+    state["windows"] = {xid: e for xid, e in saved.items() if xid in alive}
+
+    unmaximize([t[0] for t in targets])
+    place_all(targets)
+    write_json(STATE_FILE, state)
+
+
+def restore(screen):
+    state = load_state()
+    windows = {str(w.get_xid()): w for w in screen.get_windows()}
+    found = [(windows[xid], e) for xid, e in state["windows"].items() if xid in windows]
+    unmaximize([w for w, _ in found])
+    place_all([(w, *e["geometry"]) for w, e in found])
+    pump(0.1)
+    for w, e in found:
+        if e.get("maximized"):
+            w.maximize()
+    write_json(STATE_FILE, {"windows": {}, "layouts": {}})
+
+
+def parse_layout(arg):
+    """(columns, rows) for a tile argument, or None."""
+    if arg in LAYOUTS:
+        return LAYOUTS[arg]
+    parts = arg.split()
+    if len(parts) == 2 and parts[0] == "rows" and parts[1].isdigit() and int(parts[1]) > 0:
+        return "auto", int(parts[1])
+    if arg.startswith("grid-"):
+        arg = arg[5:]
+    counts = arg.split("x")
+    if 1 <= len(counts) <= 2 and all(n.isdigit() and int(n) > 0 for n in counts):
+        return (int(counts[0]), "auto") if len(counts) == 1 else tuple(map(int, counts))
+    return None
+
+
+def snap_daemon():
+    """Snap windows dropped with the mouse into the column, row or grid cell
+    under the pointer (the grid "Tile automatically" uses), and tile new
+    windows into the layout last used on their monitor.
+
+    Watches window moves; a move while the left button is down is a drag,
+    and the drag ends when the button comes up. With "resizeNeighbours"
+    on, a window resized with the mouse takes the left or right edge of
+    the windows beside it along. Exits when none of these is turned on. Only one instance runs per session.
+    """
+    if not daemon_wanted(load_settings()):
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or os.path.dirname(STATE_FILE)
+    os.makedirs(runtime, exist_ok=True)
+    lock = open(os.path.join(runtime, "xfce-tile-snap.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # already running
+
+    screen = Wnck.Screen.get_default()
+    screen.force_update()
+    root = Gdk.get_default_root_window()
+    seat_pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+    last = {}           # xid -> last seen geometry
+    drag = {"window": None, "busy": False, "shift": False}
+
+    def pointer_state():
+        _, x, y, mask = root.get_device_position(seat_pointer)
+        return (x, y, bool(mask & Gdk.ModifierType.BUTTON1_MASK),
+                bool(mask & Gdk.ModifierType.SHIFT_MASK))
+
+    def remember_all():
+        for o in screen.get_windows():
+            last[o.get_xid()] = tuple(o.get_geometry())
+
+    def busy(fn, *args):
+        drag["busy"] = True
+        try:
+            fn(*args)
+            pump(0.2)
+        finally:
+            drag["busy"] = False
+            remember_all()
+
+    def snap_grid(settings, monitor, swapped):
+        """Columns and rows to snap into; swapped turns columns into rows."""
+        columns = auto_columns(settings, monitor)
+        rows = auto_rows(settings, monitor)
+        if not swapped:
+            return columns, rows
+        if settings["vertical"] and settings["horizontal"]:
+            return rows, columns
+        if settings["vertical"]:
+            return 1, rows_for(settings, monitor)
+        return columns_for(settings, monitor), 1
+
+    def drop(w, x, y, shift):
+        settings = load_settings()
+        if settings["disabled"] or not settings["snap"]:
+            return
+        # With both Shift options on, Shift snaps the other way and a plain
+        # drop does not snap.
+        if settings["snapShiftOnly"] and not shift:
+            return
+        monitor = monitor_at(x, y)
+        area = usable_area(screen, monitor)
+        columns, rows = snap_grid(settings, monitor, shift and settings["snapShiftSwap"])
+        col, row = cell_at(area, columns, rows, x, y)
+        box = cell_box(area, columns, rows, col, row, gap_for(settings, monitor))
+
+        def snap_to():
+            unmaximize([w])
+            place_all([(w, *box)])
+        busy(snap_to)
+
+    def tile_new(w):
+        """Tile a newly opened window with the others on its monitor, in
+        the layout last used there (or the automatic one)."""
+        settings = load_settings()
+        if (settings["disabled"] or not settings["tileNew"]
+                or w.get_xid() not in last or drag["busy"]
+                or not tileable(w)):
+            return False
+        workspace = screen.get_active_workspace()
+        if workspace is not None and not w.is_on_workspace(workspace):
+            return False
+        monitor = monitor_at(*center(w))
+        layout = load_state()["layouts"].get(monitor_key(monitor), ["auto", "auto"])
+        busy(tile, screen, layout[0], layout[1], monitor)
+        return False
+
+    def poll_drop():
+        w = drag["window"]
+        x, y, down, shift = pointer_state()
+        if down and w is not None:
+            # Shift may be let go a moment before the button: remember it.
+            drag["shift"] = drag["shift"] or shift
+            return True
+        drag["window"] = None
+        if w is not None and w.get_xid() in last:
+            drop(w, x, y, shift or drag["shift"])
+        return False
+
+    # A window being resized with the mouse, and the windows beside it:
+    # {"window", "start", "left": [(w, box)], "right": [...], "boxes": {}}.
+    resize = {}
+
+    def neighbours(w, start):
+        """Windows whose frame touches the left or right edge of start (w's
+        frame before the resize), one gap apart and overlapping it."""
+        settings = load_settings()
+        x, y, width, height = start
+        slack = gap_for(settings, monitor_at(x + width / 2, y + height / 2)) + 8
+        left, right = [], []
+        workspace = screen.get_active_workspace()
+        for o in screen.get_windows():
+            if o == w or not tileable(o) or (workspace and not o.is_on_workspace(workspace)):
+                continue
+            ox, oy, ow, oh = last.get(o.get_xid(), o.get_geometry())
+            if oy >= y + height or oy + oh <= y:
+                continue
+            if abs(ox - (x + width)) <= slack:
+                right.append((o, (ox, oy, ow, oh)))
+            elif abs(ox + ow - x) <= slack:
+                left.append((o, (ox, oy, ow, oh)))
+        return left, right
+
+    def resize_step(new):
+        """Move the shared edges of the neighbours along with the window."""
+        min_width = 50
+        sx, sy, sw, sh = resize["start"]
+        x, y, width, height = new
+        boxes = {}
+        if x + width != sx + sw:
+            for o, (ox, oy, ow, oh) in resize["right"]:
+                nx = x + width + (ox - (sx + sw))
+                if ox + ow - nx >= min_width:
+                    boxes[o] = (nx, oy, ox + ow - nx, oh)
+        if x != sx:
+            for o, (ox, oy, ow, oh) in resize["left"]:
+                end = x - (sx - (ox + ow))
+                if end - ox >= min_width:
+                    boxes[o] = (ox, oy, end - ox, oh)
+        drag["busy"] = True
+        try:
+            for o, (bx, by, bw, bh) in boxes.items():
+                dw, dh = frame_extra(o)
+                o.set_geometry(Wnck.WindowGravity.NORTHWEST, GEOMETRY_MASK,
+                               bx, by, max(bw - dw, 1), max(bh - dh, 1))
+                resize["boxes"][o] = (bx, by, bw, bh)
+        finally:
+            drag["busy"] = False
+
+    def poll_resize():
+        if pointer_state()[2]:
+            return True
+        # The resize ended: put the neighbours exactly in place, and keep
+        # Restore knowing where they were before tiling.
+        boxes = resize.pop("boxes", {})
+        resize.clear()
+        if boxes:
+            busy(place_all, [(o, *box) for o, box in boxes.items()])
+            state = load_state()
+            for o, box in boxes.items():
+                entry = state["windows"].get(str(o.get_xid()))
+                if entry:
+                    entry["placed"] = list(box)
+            write_json(STATE_FILE, state)
+        return False
+
+    def on_geometry(w):
+        old = last.get(w.get_xid())
+        new = tuple(w.get_geometry())
+        last[w.get_xid()] = new
+        if drag["busy"] or drag["window"] is not None or old is None:
+            return
+        moved = old[:2] != new[:2]
+        resized = old[2:] != new[2:]
+        if resize:
+            if resize["window"] == w:
+                resize_step(new)
+            return
+        if resized and pointer_state()[2] and tileable(w):
+            settings = load_settings()
+            if settings["resizeNeighbours"] and not settings["disabled"]:
+                left, right = neighbours(w, old)
+                if left or right:
+                    resize.update(window=w, start=old, left=left, right=right, boxes={})
+                    resize_step(new)
+                    GLib.timeout_add(50, poll_resize)
+            return
+        if moved and not resized and pointer_state()[2] and tileable(w):
+            drag["window"] = w
+            drag["shift"] = False
+            GLib.timeout_add(50, poll_drop)
+
+    def watch(w):
+        last[w.get_xid()] = tuple(w.get_geometry())
+        w.connect("geometry-changed", on_geometry)
+
+    for w in screen.get_windows():
+        watch(w)
+
+    def on_opened(screen, w):
+        watch(w)
+        # Give the application a moment to map and size its window first.
+        GLib.timeout_add(400, tile_new, w)
+
+    screen.connect("window-opened", on_opened)
+    screen.connect("window-closed", lambda s, w: last.pop(w.get_xid(), None))
+
+    def check_wanted():
+        if daemon_wanted(load_settings()):
+            return True
+        Gtk.main_quit()
+        return False
+
+    GLib.timeout_add_seconds(2, check_wanted)
+    Gtk.main()
+
+
+def main():
+    args = sys.argv[1:]
+    arg = " ".join(args)
+    if arg == "snap-daemon":
+        snap_daemon()
+        return
+    if arg == "menu":
+        write_menu(load_settings())
+        return
+    if len(args) == 2 and args[0] in ("export", "import"):
+        (export_settings if args[0] == "export" else import_settings)(args[1])
+        return
+    if arg == "get-toggles":
+        settings = load_settings()
+        for key in ("snap", "tileNew", "disabled"):
+            print(f"{key}={'true' if settings[key] else 'false'}")
+        return
+    if arg in OLD_TOGGLES:
+        toggle(OLD_TOGGLES[arg])
+        return
+    if len(args) == 2 and args[0] == "toggle":
+        if args[1] not in TOGGLE_NAMES:
+            sys.exit("usage: xfce-tile toggle snap|tile-new|disabled|vertical|horizontal")
+        toggle(TOGGLE_NAMES[args[1]])
+        return
+    layout = None if arg == "restore" else parse_layout(arg)
+    if arg != "restore" and layout is None:
+        sys.exit(__doc__.strip())
+    screen = Wnck.Screen.get_default()
+    screen.force_update()
+    if arg == "restore":
+        restore(screen)
+    else:
+        tile(screen, *layout)
+    pump(0.2)
+    Gdk.Display.get_default().sync()
+
+
+if __name__ == "__main__":
+    main()

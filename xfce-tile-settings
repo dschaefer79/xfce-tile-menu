@@ -1,0 +1,450 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+"""Settings window for xfce-tile, like the Plasma widget's settings: tiling
+on/off, new windows, columns and rows, the window gap, snapping, and the
+keyboard shortcuts.
+
+  xfce-tile-settings              open the window
+  xfce-tile-settings --shortcuts  open it on the keyboard shortcuts
+  xfce-tile-settings --default-shortcuts
+                                  give the tiling actions their default
+                                  keys, once per user (used at login)
+"""
+import importlib.machinery
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gdk, Gtk  # noqa: E402
+
+
+def load_xfce_tile():
+    """xfce-tile has no .py name; load it as a module for its settings code."""
+    path = shutil.which("xfce-tile") or "/usr/bin/xfce-tile"
+    loader = importlib.machinery.SourceFileLoader("xfce_tile", path)
+    spec = importlib.util.spec_from_loader("xfce_tile", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+tile = load_xfce_tile()
+
+# Keyboard shortcuts: label, the command it runs and its default key.
+SHORTCUTS = [
+    ("Tile automatically", "xfce-tile auto", "<Super><Alt>a"),
+    ("Tile in 4 columns", "xfce-tile 4", "<Super><Alt>4"),
+    ("Tile in 3 columns", "xfce-tile 3", "<Super><Alt>3"),
+    ("Tile in 2 columns", "xfce-tile 2", "<Super><Alt>2"),
+    ("Tile in 3 rows", "xfce-tile rows-3", "<Super><Primary><Alt>3"),
+    ("Tile in 2 rows", "xfce-tile rows-2", "<Super><Primary><Alt>2"),
+    ("Tile in 2 × 2 grid", "xfce-tile grid-2x2", "<Super><Primary>2"),
+    ("Tile in 3 × 2 grid", "xfce-tile grid-3x2", "<Super><Primary>3"),
+    ("Tile in 4 × 2 grid", "xfce-tile grid-4x2", "<Super><Primary>4"),
+    ("Restore windows", "xfce-tile restore", "<Super><Alt>0"),
+    ("Turn automatic tiling on or off", "xfce-tile toggle snap", None),
+    ("Turn tiling new windows on or off", "xfce-tile toggle tile-new", None),
+    ("Disable or enable tiling", "xfce-tile toggle disabled", None),
+]
+# Bump when the default keys change, so --default-shortcuts runs again.
+DEFAULT_SHORTCUTS_VERSION = "1"
+DEFAULT_SHORTCUTS_MARKER = os.path.join(tile.CONFIG_DIR, "default-shortcuts")
+# Shortcuts are XFCE application shortcuts; xfce-tile keeps them.
+xfconf = tile.xfconf_shortcuts
+custom_shortcuts = tile.custom_shortcuts
+use_custom_shortcuts = tile.use_custom_shortcuts
+set_shortcut = tile.set_shortcut
+
+
+def default_shortcuts():
+    """Give each tiling action its default key, once per user: only
+    actions without a shortcut, and only keys nothing else uses."""
+    try:
+        with open(DEFAULT_SHORTCUTS_MARKER) as f:
+            if f.read().strip() == DEFAULT_SHORTCUTS_VERSION:
+                return
+    except OSError:
+        pass
+    # Compare keys by their label, which does not depend on the order of
+    # the modifiers.
+    use_custom_shortcuts()
+    current = custom_shortcuts()
+    taken = {tile.accel_label(a) for a in current}
+    for _, command, default in SHORTCUTS:
+        if not default or command in current.values():
+            continue
+        key = tile.accel_label(default)
+        if key in taken:
+            continue
+        set_shortcut(command, default)
+        taken.add(key)
+    os.makedirs(tile.CONFIG_DIR, exist_ok=True)
+    with open(DEFAULT_SHORTCUTS_MARKER, "w") as f:
+        f.write(DEFAULT_SHORTCUTS_VERSION + "\n")
+
+
+def capture_shortcut(parent, title):
+    """Ask for a key combination: an accelerator, "" to remove the
+    shortcut, or None if cancelled."""
+    dialog = Gtk.Dialog(title=title, transient_for=parent, modal=True)
+    dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+    label = Gtk.Label(label="Press the new shortcut.\n\n"
+                            "Backspace removes the shortcut, Esc cancels.",
+                      justify=Gtk.Justification.CENTER, margin=24)
+    dialog.get_content_area().add(label)
+    result = {}
+
+    def on_key(widget, event):
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+        keyval = Gdk.keyval_to_lower(event.keyval)
+        if not mods and keyval == Gdk.KEY_Escape:
+            dialog.response(Gtk.ResponseType.CANCEL)
+        elif not mods and keyval == Gdk.KEY_BackSpace:
+            result["accel"] = ""
+            dialog.response(Gtk.ResponseType.OK)
+        elif Gtk.accelerator_valid(keyval, mods) and (
+                # Plain keys would stop typing them; function keys are fine.
+                mods or Gdk.KEY_F1 <= keyval <= Gdk.KEY_F35):
+            result["accel"] = Gtk.accelerator_name(keyval, mods)
+            dialog.response(Gtk.ResponseType.OK)
+        return True
+
+    dialog.connect("key-press-event", on_key)
+    dialog.show_all()
+    response = dialog.run()
+    dialog.destroy()
+    return result.get("accel") if response == Gtk.ResponseType.OK else None
+
+
+def small(text):
+    label = Gtk.Label(xalign=0)
+    label.set_markup(f"<small>{text}</small>")
+    label.set_line_wrap(True)
+    label.set_max_width_chars(60)
+    return label
+
+
+def heading(text):
+    label = Gtk.Label(xalign=0, margin_top=6)
+    label.set_markup(f"<b>{text}</b>")
+    return label
+
+
+def tiling_page(settings, changed):
+    """The Tiling page; changed() is called after each change."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=12)
+    widgets = {}
+
+    def check(key, label, hint=None, indent=0):
+        button = Gtk.CheckButton(label=label, margin_start=indent)
+        button.set_active(settings[key])
+        button.connect("toggled", lambda b: (settings.__setitem__(key, b.get_active()), changed()))
+        box.pack_start(button, False, False, 0)
+        if hint:
+            note = small(hint)
+            note.set_margin_start(indent + 24)
+            box.pack_start(note, False, False, 0)
+        widgets[key] = button
+        return button
+
+    grid_rows = {}
+
+    def spin(grid, row, key, label, unit=""):
+        name = Gtk.Label(label=label, xalign=0)
+        grid.attach(name, 0, row, 1, 1)
+        low, high = tile.LIMITS[key]
+        button = Gtk.SpinButton.new_with_range(low, high, 1)
+        button.set_value(settings[key])
+        button.connect("value-changed",
+                       lambda b: (settings.__setitem__(key, b.get_value_as_int()), changed()))
+        grid.attach(button, 1, row, 1, 1)
+        grid.attach(Gtk.Label(label=unit, xalign=0), 2, row, 1, 1)
+        widgets[key] = button
+        grid_rows[key] = name
+        return button
+
+    box.pack_start(heading("Panel"), False, False, 0)
+    check("showMenu", "Show the Tiling menu on the panel",
+          "Untick to take it off, as Quit in the menu does.")
+
+    box.pack_start(heading("Tiling"), False, False, 0)
+    check("disabled", "Disable tiling completely",
+          "Nothing is tiled or snapped while this is on; Restore windows still works.")
+    check("tileNew", "Tile new windows automatically",
+          "Each window that opens is tiled together with the others on its screen, "
+          "in the layout last used there (at first, “Tile automatically”).")
+    check("showAuto", "Show “Tile automatically” in the menu",
+          "Untick to keep only the entries with a fixed number of columns or rows.")
+
+    box.pack_start(heading("Columns and rows"), False, False, 0)
+    box.pack_start(small("With both on, windows are tiled into a grid of columns and rows."),
+                   False, False, 0)
+    grid = Gtk.Grid(row_spacing=6, column_spacing=12, margin_start=12)
+    vertical = Gtk.CheckButton(label="Vertical: tile into columns side by side")
+    vertical.set_active(settings["vertical"])
+    vertical.connect("toggled", lambda b: (settings.__setitem__("vertical", b.get_active()), changed()))
+    widgets["vertical"] = vertical
+    grid.attach(vertical, 0, 0, 3, 1)
+    spin(grid, 1, "wideMinWidth", "Wide screen from", "pixels wide")
+    spin(grid, 2, "wideColumns", "Columns on wide screens")
+    spin(grid, 3, "normalColumns", "Columns on other screens")
+    horizontal = Gtk.CheckButton(label="Horizontal: tile into rows stacked top to bottom",
+                                 margin_top=6)
+    horizontal.set_active(settings["horizontal"])
+    horizontal.connect("toggled", lambda b: (settings.__setitem__("horizontal", b.get_active()), changed()))
+    widgets["horizontal"] = horizontal
+    grid.attach(horizontal, 0, 4, 3, 1)
+    spin(grid, 5, "tallMinHeight", "Tall screen from", "pixels high")
+    spin(grid, 6, "tallRows", "Rows on tall screens")
+    spin(grid, 7, "normalRows", "Rows on other screens")
+    box.pack_start(grid, False, False, 0)
+
+    box.pack_start(heading("Gap between windows"), False, False, 0)
+    gap_row = Gtk.Box(spacing=6, margin_start=12)
+    gap_px = Gtk.SpinButton.new_with_range(*tile.LIMITS["gap"], 1)
+    gap_px.set_value(settings["gap"])
+    gap_px.connect("value-changed", lambda b: (settings.__setitem__("gap", b.get_value_as_int()), changed()))
+    gap_mm = Gtk.SpinButton.new_with_range(*tile.LIMITS["gapMm"], 1)
+    gap_mm.set_value(settings["gapMm"])
+    gap_mm.connect("value-changed", lambda b: (settings.__setitem__("gapMm", b.get_value_as_int()), changed()))
+    unit = Gtk.ComboBoxText()
+    unit.append("px", "pixels")
+    unit.append("mm", "mm")
+    unit.set_active_id(settings["gapUnit"])
+    unit.connect("changed", lambda c: (settings.__setitem__("gapUnit", c.get_active_id()), changed()))
+    for w in (gap_px, gap_mm, unit):
+        gap_row.pack_start(w, False, False, 0)
+    box.pack_start(gap_row, False, False, 0)
+    mm_note = small("Millimetres on the screen, worked out from its physical size.")
+    mm_note.set_margin_start(12)
+    box.pack_start(mm_note, False, False, 0)
+
+    box.pack_start(heading("Resizing"), False, False, 0)
+    check("resizeNeighbours", "Resize neighbouring windows together",
+          "Dragging the left or right edge of a window also moves the edge of the "
+          "window next to it, so windows side by side stay together.")
+
+    box.pack_start(heading("Snapping"), False, False, 0)
+    check("snap", "Automatic tiling: snap windows into place when dropped")
+    shift_only = check("snapShiftOnly", "Only when Shift is held while dropping", indent=24)
+    shift_swap = check("snapShiftSwap", "", indent=24)
+    snap_note = small("")
+    snap_note.set_margin_start(24)
+    box.pack_start(snap_note, False, False, 0)
+
+    box.pack_start(heading("Window effects"), False, False, 0)
+    check("windowEffects", "Window effects: shadows, transparency and fading",
+          "Untick to turn them off for all windows. The same as “Enable display "
+          "compositing” in Window Manager Tweaks.")
+
+    def update():
+        v, h = settings["vertical"], settings["horizontal"]
+        # Keep at least one direction on.
+        vertical.set_sensitive(not v or h)
+        horizontal.set_sensitive(not h or v)
+        for key in ("wideMinWidth", "wideColumns", "normalColumns"):
+            widgets[key].set_sensitive(v)
+            grid_rows[key].set_sensitive(v)
+        for key in ("tallMinHeight", "tallRows", "normalRows"):
+            widgets[key].set_sensitive(h)
+            grid_rows[key].set_sensitive(h)
+        for key in ("tileNew", "showAuto"):
+            widgets[key].set_sensitive(not settings["disabled"])
+        mm = settings["gapUnit"] == "mm"
+        gap_px.set_visible(not mm)
+        gap_mm.set_visible(mm)
+        mm_note.set_visible(mm)
+
+        on = settings["snap"]
+        shift_only.set_sensitive(on)
+        shift_swap.set_sensitive(on)
+        shift_swap.set_label("Hold Shift to swap columns and rows" if v and h else
+                             "Hold Shift to snap into rows instead of columns" if v else
+                             "Hold Shift to snap into columns instead of rows")
+        other = ("with columns and rows swapped" if v and h else
+                 "into the row" if v else "into the column")
+        here = "the grid cell" if v and h else "the column" if v else "the row"
+        only, swap = settings["snapShiftOnly"], settings["snapShiftSwap"]
+        if not on:
+            text = ("Drag a window with the mouse and let go: with snapping on, it fills "
+                    "the column, row or grid cell under the pointer.")
+        elif only and swap:
+            text = ("A window dropped normally stays where it is. Hold Shift while "
+                    f"dropping to snap it {other} under the pointer.")
+        elif only:
+            text = ("A window dropped normally stays where it is. Hold Shift while "
+                    f"dropping to make it fill {here} under the pointer.")
+        elif swap:
+            text = (f"A dropped window fills {here} under the pointer. Hold Shift "
+                    f"while dropping to snap it {other} instead.")
+        else:
+            text = f"A dropped window fills {here} under the pointer."
+        snap_note.set_markup(f"<small>{text}</small>")
+
+    return box, update
+
+
+def shortcuts_page(window):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=12)
+    box.pack_start(small("Shortcuts work anywhere in Xfce. They are application shortcuts, "
+                         "also listed in Settings › Keyboard › Application Shortcuts."),
+                   False, False, 0)
+    grid = Gtk.Grid(row_spacing=6, column_spacing=12, margin_top=6)
+    box.pack_start(grid, False, False, 0)
+    labels = {}
+
+    def refresh():
+        by_command = {cmd: accel for accel, cmd in custom_shortcuts().items()}
+        for command, label in labels.items():
+            accel = by_command.get(command)
+            if accel:
+                key, mods = Gtk.accelerator_parse(accel)
+                label.set_text(Gtk.accelerator_get_label(key, mods) or accel)
+            else:
+                label.set_text("None")
+
+    def on_set(button, title, command):
+        accel = capture_shortcut(window, title)
+        if accel is None:
+            return
+        taken = custom_shortcuts().get(accel)
+        if accel and taken and taken != command:
+            dialog = Gtk.MessageDialog(
+                transient_for=window, modal=True, message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.OK_CANCEL,
+                text=f"{Gtk.accelerator_get_label(*Gtk.accelerator_parse(accel))} "
+                     f"already runs “{taken}”. Use it for “{title}” instead?")
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+        set_shortcut(command, accel)
+        refresh()
+
+    for row, (title, command, _) in enumerate(SHORTCUTS):
+        grid.attach(Gtk.Label(label=title, xalign=0, hexpand=True), 0, row, 1, 1)
+        label = Gtk.Label(xalign=0)
+        label.get_style_context().add_class("dim-label")
+        labels[command] = label
+        grid.attach(label, 1, row, 1, 1)
+        button = Gtk.Button(label="Set…")
+        button.connect("clicked", on_set, title, command)
+        grid.attach(button, 2, row, 1, 1)
+        clear = Gtk.Button.new_from_icon_name("edit-clear-symbolic", Gtk.IconSize.BUTTON)
+        clear.set_tooltip_text("Remove the shortcut")
+        clear.connect("clicked", lambda b, c: (set_shortcut(c, None), refresh()), command)
+        grid.attach(clear, 3, row, 1, 1)
+    refresh()
+    return box
+
+
+def main():
+    if sys.argv[1:] == ["--default-shortcuts"]:
+        default_shortcuts()
+        return
+    page = "shortcuts" if sys.argv[1:] == ["--shortcuts"] else "tiling"
+    if sys.argv[1:] not in ([], ["--shortcuts"]):
+        sys.exit("usage: xfce-tile-settings [--shortcuts|--default-shortcuts]")
+    settings = tile.load_settings()
+    # Not tiling settings: xfwm4's compositor and the panel button,
+    # applied with the others.
+    settings["windowEffects"] = tile.window_effects()
+    settings["showMenu"] = subprocess.run(
+        ["xfce-tile-menu-setup", "--status"], capture_output=True, text=True).stdout.strip() == "on"
+    saved = dict(settings)
+
+    win = Gtk.Window(title="Window Tiling")
+    win.set_icon_name("org.xfce.settings.manager")
+    win.set_border_width(6)
+    win.set_resizable(False)
+    win.connect("destroy", Gtk.main_quit)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    win.add(outer)
+
+    def changed():
+        update()
+        btn_apply.set_sensitive(settings != saved)
+
+    notebook = Gtk.Notebook()
+    tiling, update = tiling_page(settings, changed)
+    notebook.append_page(tiling, Gtk.Label(label="Tiling"))
+    notebook.append_page(shortcuts_page(win), Gtk.Label(label="Keyboard shortcuts"))
+    outer.pack_start(notebook, True, True, 0)
+
+    def apply(*_):
+        tile.save_settings({k: v for k, v in settings.items()
+                            if k not in ("windowEffects", "showMenu")})
+        if settings["windowEffects"] != saved.get("windowEffects"):
+            tile.set_window_effects(settings["windowEffects"])
+        if settings["showMenu"] != saved.get("showMenu"):
+            # Restarts the panel, which takes a moment.
+            subprocess.Popen(["xfce-tile-menu-setup"] + ([] if settings["showMenu"] else ["--remove"]),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        saved.clear()
+        saved.update(settings)
+        btn_apply.set_sensitive(False)
+
+    def on_delete(*_):
+        """Ask about unsaved changes; True keeps the window open."""
+        if settings == saved:
+            return False
+        dialog = Gtk.MessageDialog(
+            transient_for=win, modal=True, message_type=Gtk.MessageType.QUESTION,
+            text="Apply your changes before closing?",
+        )
+        dialog.add_buttons("Discard", Gtk.ResponseType.NO,
+                           "Cancel", Gtk.ResponseType.CANCEL,
+                           "Apply", Gtk.ResponseType.YES)
+        dialog.set_default_response(Gtk.ResponseType.YES)
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.YES:
+            apply()
+        return response not in (Gtk.ResponseType.YES, Gtk.ResponseType.NO)
+
+    btn_apply = Gtk.Button(label="Apply")
+    btn_apply.set_sensitive(False)
+    btn_apply.connect("clicked", apply)
+    btn_close = Gtk.Button(label="Close")
+    btn_close.connect("clicked", lambda *_: win.close())
+    win.connect("delete-event", on_delete)
+    bottom = Gtk.Box(spacing=6)
+    bottom.pack_end(btn_apply, False, False, 0)
+    bottom.pack_end(btn_close, False, False, 0)
+
+    # The settings of both menus and the shortcuts in one file.
+    def save_file(*_):
+        if settings != saved:
+            apply()
+        tile.settings_file_dialog(win, save=True)
+
+    def load_file(*_):
+        if tile.settings_file_dialog(win, save=False):
+            # Open again, showing the loaded settings.
+            os.execv(sys.argv[0], sys.argv)
+
+    btn_save = Gtk.Button(label="Save settings to file…")
+    btn_save.connect("clicked", save_file)
+    btn_load = Gtk.Button(label="Load settings from file…")
+    btn_load.connect("clicked", load_file)
+    bottom.pack_start(btn_save, False, False, 0)
+    bottom.pack_start(btn_load, False, False, 0)
+    outer.pack_start(bottom, False, False, 0)
+
+    win.show_all()
+    update()
+    if page == "shortcuts":
+        notebook.set_current_page(1)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

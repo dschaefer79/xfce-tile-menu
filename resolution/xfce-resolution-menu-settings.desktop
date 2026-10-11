@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 dschaefer79
+# Written entirely with Claude Code (Anthropic).
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Resolution Menu
+Comment=Add or remove resolutions in the panel resolution menu
+Icon=org.xfce.settings.manager
+Exec=xfce-resolution-menu-settings
+Terminal=false
+StartupNotify=true
+Categories=Settings;DesktopSettings;X-XFCE-SettingsDialog;X-XFCE-HardwareSettings;

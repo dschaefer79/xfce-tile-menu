@@ -1,0 +1,30 @@
+<!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
+  "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     Copyright (C) 2026 dschaefer79
+     Written entirely with Claude Code (Anthropic). -->
+<!-- Default menu, used until xfce-tile writes each user's own menu. -->
+<Menu>
+  <Name>Tiling</Name>
+  <AppDir>/usr/share/xfce-tile-menu/items</AppDir>
+  <Include><All/></Include>
+  <Layout>
+    <Filename>xfce-tile-auto.desktop</Filename>
+    <Filename>xfce-tile-4.desktop</Filename>
+    <Filename>xfce-tile-3.desktop</Filename>
+    <Filename>xfce-tile-2.desktop</Filename>
+    <Filename>xfce-tile-grid-2x2.desktop</Filename>
+    <Filename>xfce-tile-grid-3x2.desktop</Filename>
+    <Filename>xfce-tile-grid-4x2.desktop</Filename>
+    <Separator/>
+    <Filename>xfce-tile-restore.desktop</Filename>
+    <Separator/>
+    <Filename>xfce-tile-toggle-snap.desktop</Filename>
+    <Filename>xfce-tile-toggle-tile-new.desktop</Filename>
+    <Filename>xfce-tile-toggle-disabled.desktop</Filename>
+    <Separator/>
+    <Filename>xfce-tile-shortcuts.desktop</Filename>
+    <Filename>xfce-tile-settings.desktop</Filename>
+    <Filename>xfce-tile-quit.desktop</Filename>
+  </Layout>
+</Menu>
