@@ -61,13 +61,24 @@ off, `--status` says whether they are there).
 
 ## Installing
 
-On **Fedora 45**:
+From the [latest GitHub release](https://github.com/dschaefer79/xfce-tile-menu/releases/latest):
+
+| System | Desktop | Package |
+|---|---|---|
+| Fedora 45 | Xfce 4.20 | `xfce-tile-menu-2.17-1.fc45.noarch.rpm` |
+| Fedora 44 | Xfce 4.20 | `xfce-tile-menu-2.17-1.fc44.noarch.rpm` |
+| Ubuntu 26.10 | Xfce 4.20 | `xfce-tile-menu_2.17-1_all.deb` |
+| Debian 13 (trixie) | Xfce 4.20 | `xfce-tile-menu_2.17-1_all.deb` |
+
+On Fedora:
 
 ```
 sudo dnf install https://github.com/dschaefer79/xfce-tile-menu/releases/download/v2.17/xfce-tile-menu-2.17-1.fc45.noarch.rpm
 ```
 
-On **Debian 13** (trixie):
+(`fc44` instead of `fc45` on Fedora 44).
+
+On Ubuntu, Debian and Linux Mint:
 
 ```
 wget https://github.com/dschaefer79/xfce-tile-menu/releases/download/v2.17/xfce-tile-menu_2.17-1_all.deb
